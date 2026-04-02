@@ -1,12 +1,12 @@
 # Screw Detection Prototype
-PraxiS II
+Praxis II Project - Screw Organizing for GTA Woodworks
 
 ## Overview
 
 Mid-fidelity Python prototype that detects when a screw enters a defined region in a camera feed, captures an image, and uses OpenAI to verify if a screw is present. Based on the result, it outputs an action.
 
 ## Feature
-* OpenCV for real-time detection
+* OpenCV for detection
 * Learns an empty background before detecting objects
 * Triggers capture when a new object enters the ROI
 * Crops and saves only the inspection region (`captures/latest_capture.jpg`)
@@ -17,8 +17,8 @@ Mid-fidelity Python prototype that detects when a screw enters a defined region 
 ## Controls
 * `q` quit
 * `c` manual capture
-* `n` next camera
-* `p` previous camera
+* `n` next camera (connected to laptop)
+* `p` previous camera (connected to laptop)
 * `r` reset detection
 
 ## Setup
