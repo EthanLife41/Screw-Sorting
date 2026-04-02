@@ -10,7 +10,7 @@ import base64
 import numpy as np
 from openai import OpenAI
 
-#config
+# config
 CAMERA_INDEX_CANDIDATES = [1, 0]
 PREFERRED_CAMERA_ORDER = [1, 0]
 
@@ -46,6 +46,9 @@ OBJECT_MIN_AREA_FRACTION = 0.003
 OBJECT_MAX_AREA_FRACTION = 0.32
 OBJECT_FRAMES_REQUIRED = 4
 
+# time confirmation before capture
+OBJECT_CONFIRMATION_TIME = 3
+
 FRAME_DIFF_THRESHOLD = 20
 MAX_MOTION_AREA_FOR_EXTREME_MOVEMENT = 20000
 
@@ -68,7 +71,7 @@ resume_button_rect = None
 def create_openai_client():
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is not set.")
+        raise RuntimeError("OPENAI_API_KEY is not set. Go to .env.")
     return OpenAI(api_key=api_key)
 
 
@@ -142,11 +145,11 @@ def analyze_image_for_screw(client, image_path):
 
 def action_from_result(result):
     if result == "YES":
-        return "ACTION: OPEN TRAPDOOR A"
-    return "ACTION: DO NOTHING"
+        return "ACTION: OPEN TRAPDOOR"
+    return "ACTION: DO NOTHING/THROWAWAY"
 
 
-#Camera
+# Camera
 def configure_camera(cap):
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
@@ -267,6 +270,29 @@ def draw_status_text(frame, lines, colour=(0, 255, 0)):
         y += 28
 
 
+def draw_countdown_bar(frame, x1, y1, x2, progress, label):
+    bar_width = x2 - x1
+    bar_height = 18
+    progress = max(0.0, min(1.0, progress))
+
+    cv2.rectangle(frame, (x1, y1), (x2, y1 + bar_height), (255, 255, 255), 2)
+
+    fill_width = int(bar_width * progress)
+    if fill_width > 0:
+        cv2.rectangle(frame, (x1, y1), (x1 + fill_width, y1 + bar_height), (0, 255, 0), -1)
+
+    cv2.putText(
+        frame,
+        label,
+        (x1, y1 - 8),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA
+    )
+
+
 def save_roi_image(roi_bgr):
     ensure_capture_dir()
     ok = cv2.imwrite(CAPTURE_PATH, roi_bgr)
@@ -282,6 +308,7 @@ def resize_to_fit(image, max_width, max_height):
     if scale >= 1.0:
         return image.copy()
     return cv2.resize(image, (int(w * scale), int(h * scale)))
+
 
 # state
 class DetectionState:
@@ -310,6 +337,8 @@ class DetectionState:
         self.empty_baseline_pixels = None
         self.empty_baseline_blob = None
 
+        self.object_detect_start_time = None
+
     def full_reset(self):
         self.prev_roi_gray = None
         self.background_roi_gray = None
@@ -331,6 +360,8 @@ class DetectionState:
         self.empty_baseline_pixels = None
         self.empty_baseline_blob = None
 
+        self.object_detect_start_time = None
+
     def reset_after_capture(self):
         self.empty_frame_count = 0
         self.object_frame_count = 0
@@ -341,6 +372,7 @@ class DetectionState:
         self.last_motion_area = 0.0
         self.last_area_fraction = 0.0
         self.last_presence_mask = None
+        self.object_detect_start_time = None
 
     def set_empty_baseline(self, changed_pixels, largest_blob):
         self.empty_baseline_pixels = changed_pixels
@@ -430,7 +462,8 @@ def analyse_roi(state, roi_bgr):
 
     return "READY", changed_pixels, largest_blob_area, area_fraction, motion_area, cv2.cvtColor(presence_mask, cv2.COLOR_GRAY2BGR)
 
-#results
+
+# results
 def draw_button(frame, x1, y1, x2, y2, text):
     cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 255), -1)
     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 0), 2)
@@ -510,6 +543,7 @@ def capture_and_process(client, roi_bgr):
     result_label = result if result is not None else "NO"
     result_action = action_from_result(result_label)
     return image_path, result_label, result_action
+
 
 def main():
     print("Starting screw detection prototype...")
@@ -593,11 +627,15 @@ def main():
             roi_colour = (0, 255, 0) if detection_state.armed else (0, 255, 255)
             cv2.rectangle(display_frame, (x1, y1), (x2, y2), roi_colour, 2)
 
+            countdown_progress = None
+            countdown_label = None
+
             if phase == "SETTLING":
                 detection_state.status_message = f"Settling camera... {detection_state.settle_frames}/{SETTLE_FRAMES_REQUIRED}"
                 detection_state.empty_frame_count = 0
                 detection_state.object_frame_count = 0
                 detection_state.armed = False
+                detection_state.object_detect_start_time = None
 
             elif phase == "LEARNING":
                 detection_state.status_message = (
@@ -606,6 +644,7 @@ def main():
                 detection_state.empty_frame_count = 0
                 detection_state.object_frame_count = 0
                 detection_state.armed = False
+                detection_state.object_detect_start_time = None
 
             elif in_cooldown:
                 remaining = COOLDOWN_SECONDS - (current_time - detection_state.last_trigger_time)
@@ -613,6 +652,7 @@ def main():
                 detection_state.empty_frame_count = 0
                 detection_state.object_frame_count = 0
                 detection_state.armed = False
+                detection_state.object_detect_start_time = None
 
             else:
                 if detection_state.empty_baseline_pixels is None:
@@ -632,6 +672,8 @@ def main():
                 )
 
                 if not detection_state.armed:
+                    detection_state.object_detect_start_time = None
+
                     if looks_empty:
                         detection_state.empty_frame_count += 1
                         detection_state.object_frame_count = 0
@@ -661,15 +703,25 @@ def main():
                 else:
                     if looks_empty:
                         detection_state.object_frame_count = 0
+                        detection_state.object_detect_start_time = None
                         detection_state.status_message = "Armed: waiting for next object..."
+
                     else:
                         if looks_like_object and motion_area <= MAX_MOTION_AREA_FOR_EXTREME_MOVEMENT:
-                            detection_state.object_frame_count += 1
+                            if detection_state.object_detect_start_time is None:
+                                detection_state.object_detect_start_time = time.time()
+
+                            elapsed = time.time() - detection_state.object_detect_start_time
+                            progress = min(elapsed / OBJECT_CONFIRMATION_TIME, 1.0)
+
+                            countdown_progress = progress
+                            countdown_label = f"Hold steady for capture: {elapsed:.1f}s / {OBJECT_CONFIRMATION_TIME:.1f}s"
+
                             detection_state.status_message = (
-                                f"New object detected: {detection_state.object_frame_count}/{OBJECT_FRAMES_REQUIRED}"
+                                f"Holding object... {elapsed:.1f}s / {OBJECT_CONFIRMATION_TIME:.1f}s"
                             )
 
-                            if detection_state.object_frame_count >= OBJECT_FRAMES_REQUIRED:
+                            if elapsed >= OBJECT_CONFIRMATION_TIME:
                                 image_path, result_label, result_action = capture_and_process(client, roi.copy())
 
                                 app_state.mode = "RESULT"
@@ -684,13 +736,17 @@ def main():
                                 detection_state.last_trigger_time = time.time()
                                 detection_state.object_frame_count = 0
                                 detection_state.empty_frame_count = 0
+                                detection_state.object_detect_start_time = None
                                 detection_state.armed = False
                                 detection_state.last_result_message = "Last trigger: automatic"
                         else:
+                            detection_state.object_detect_start_time = None
+
                             if area_fraction > OBJECT_MAX_AREA_FRACTION:
                                 detection_state.status_message = "Large object rejected..."
                             else:
-                                detection_state.status_message = "Object uncertain or moving too much..."
+                                detection_state.status_message = "Object unstable or moving too much..."
+
                             detection_state.object_frame_count = max(0, detection_state.object_frame_count - 1)
 
             lines = [
@@ -701,7 +757,6 @@ def main():
                 f"Area fraction: {area_fraction:.3f}",
                 f"Motion area: {motion_area:.0f}",
                 f"Armed: {detection_state.armed}",
-                f"Object frames: {detection_state.object_frame_count}/{OBJECT_FRAMES_REQUIRED}",
                 detection_state.last_result_message,
                 "Keys: c capture | n next | p previous | r reset | q quit"
             ]
@@ -717,6 +772,16 @@ def main():
                 2,
                 cv2.LINE_AA
             )
+
+            if countdown_progress is not None and countdown_label is not None:
+                draw_countdown_bar(
+                    display_frame,
+                    x1,
+                    max(30, y1 + 10),
+                    x2,
+                    countdown_progress,
+                    countdown_label
+                )
 
             cv2.imshow(WINDOW_NAME, display_frame)
 
@@ -754,6 +819,7 @@ def main():
                 detection_state.last_trigger_time = time.time()
                 detection_state.object_frame_count = 0
                 detection_state.empty_frame_count = 0
+                detection_state.object_detect_start_time = None
                 detection_state.armed = False
                 detection_state.last_result_message = "Last trigger: manual"
 
